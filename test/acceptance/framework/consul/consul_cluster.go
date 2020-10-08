@@ -1,27 +1,30 @@
-package framework
+package consul
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/gruntwork-io/terratest/modules/helm"
-	"github.com/gruntwork-io/terratest/modules/k8s"
-	"github.com/gruntwork-io/terratest/modules/logger"
-	"github.com/hashicorp/consul-helm/test/acceptance/helpers"
+	terratestk8s "github.com/gruntwork-io/terratest/modules/k8s"
+	terratestLogger "github.com/gruntwork-io/terratest/modules/logger"
+	"github.com/hashicorp/consul-helm/test/acceptance/framework/config"
+	"github.com/hashicorp/consul-helm/test/acceptance/framework/environment"
+	"github.com/hashicorp/consul-helm/test/acceptance/framework/helpers"
+	"github.com/hashicorp/consul-helm/test/acceptance/framework/k8s"
+	"github.com/hashicorp/consul-helm/test/acceptance/framework/logger"
 	"github.com/hashicorp/consul/api"
-	"github.com/hashicorp/consul/sdk/freeport"
 	"github.com/stretchr/testify/require"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/portforward"
+	"k8s.io/client-go/transport/spdy"
 )
-
-// The path to the helm chart.
-// Note: this will need to be changed if this file is moved.
-const helmChartPath = "../../../.."
 
 // Cluster represents a consul cluster object
 type Cluster interface {
@@ -37,19 +40,20 @@ type Cluster interface {
 // HelmCluster implements Cluster and uses Helm
 // to create, destroy, and upgrade consul
 type HelmCluster struct {
-	ctx                TestContext
+	ctx                environment.TestContext
 	helmOptions        *helm.Options
 	releaseName        string
 	kubernetesClient   kubernetes.Interface
 	noCleanupOnFailure bool
 	debugDirectory     string
+	logger             terratestLogger.TestLogger
 }
 
 func NewHelmCluster(
 	t *testing.T,
 	helmValues map[string]string,
-	ctx TestContext,
-	cfg *TestConfig,
+	ctx environment.TestContext,
+	cfg *config.TestConfig,
 	releaseName string) Cluster {
 
 	// Deploy single-server cluster by default unless helmValues overwrites that
@@ -67,7 +71,7 @@ func NewHelmCluster(
 	opts := &helm.Options{
 		SetValues:      values,
 		KubectlOptions: ctx.KubectlOptions(t),
-		Logger:         logger.TestingT,
+		Logger:         terratestLogger.New(logger.TestLogger{}),
 	}
 	return &HelmCluster{
 		ctx:                ctx,
@@ -76,6 +80,7 @@ func NewHelmCluster(
 		kubernetesClient:   ctx.KubernetesClient(t),
 		noCleanupOnFailure: cfg.NoCleanupOnFailure,
 		debugDirectory:     cfg.DebugDirectory,
+		logger:             terratestLogger.New(logger.TestLogger{}),
 	}
 }
 
@@ -91,7 +96,7 @@ func (h *HelmCluster) Create(t *testing.T) {
 	// Fail if there are any existing installations of the Helm chart.
 	h.checkForPriorInstallations(t)
 
-	err := helm.InstallE(t, h.helmOptions, helmChartPath, h.releaseName)
+	err := helm.InstallE(t, h.helmOptions, config.HelmChartPath, h.releaseName)
 	require.NoError(t, err)
 
 	helpers.WaitForAllPodsToBeReady(t, h.kubernetesClient, h.helmOptions.KubectlOptions.Namespace, fmt.Sprintf("release=%s", h.releaseName))
@@ -100,7 +105,7 @@ func (h *HelmCluster) Create(t *testing.T) {
 func (h *HelmCluster) Destroy(t *testing.T) {
 	t.Helper()
 
-	helpers.WritePodsDebugInfoIfFailed(t, h.helmOptions.KubectlOptions, h.debugDirectory, "release="+h.releaseName)
+	k8s.WritePodsDebugInfoIfFailed(t, h.helmOptions.KubectlOptions, h.debugDirectory, "release="+h.releaseName)
 
 	helm.Delete(t, h.helmOptions, h.releaseName, false)
 
@@ -136,7 +141,7 @@ func (h *HelmCluster) Upgrade(t *testing.T, helmValues map[string]string) {
 	t.Helper()
 
 	mergeMaps(h.helmOptions.SetValues, helmValues)
-	helm.Upgrade(t, h.helmOptions, helmChartPath, h.releaseName)
+	helm.Upgrade(t, h.helmOptions, config.HelmChartPath, h.releaseName)
 	helpers.WaitForAllPodsToBeReady(t, h.kubernetesClient, h.helmOptions.KubectlOptions.Namespace, fmt.Sprintf("release=%s", h.releaseName))
 }
 
@@ -145,7 +150,7 @@ func (h *HelmCluster) SetupConsulClient(t *testing.T, secure bool) *api.Client {
 
 	namespace := h.helmOptions.KubectlOptions.Namespace
 	config := api.DefaultConfig()
-	localPort := freeport.MustTake(1)[0]
+	localPort := terratestk8s.GetAvailablePort(t)
 	remotePort := 8500 // use non-secure by default
 
 	if secure {
@@ -174,12 +179,12 @@ func (h *HelmCluster) SetupConsulClient(t *testing.T, secure bool) *api.Client {
 		}
 	}
 
-	tunnel := k8s.NewTunnel(h.helmOptions.KubectlOptions, k8s.ResourceTypePod, fmt.Sprintf("%s-consul-server-0", h.releaseName), localPort, remotePort)
-	tunnel.ForwardPort(t)
-
+	tunnelStop := make(chan struct{}, 1)
+	err := h.ForwardPortE(t, localPort, remotePort, tunnelStop)
 	t.Cleanup(func() {
-		tunnel.Close()
+		close(tunnelStop)
 	})
+	require.NoError(t, err)
 
 	config.Address = fmt.Sprintf("127.0.0.1:%d", localPort)
 	consulClient, err := api.NewClient(config)
@@ -212,5 +217,75 @@ func (h *HelmCluster) checkForPriorInstallations(t *testing.T) {
 func mergeMaps(a, b map[string]string) {
 	for k, v := range b {
 		a[k] = v
+	}
+}
+
+func (h *HelmCluster) ForwardPortE(t *testing.T, localPort, remotePort int, stopChan chan struct{}) error {
+	consulServerPodName := fmt.Sprintf("%s-consul-server-0", h.releaseName)
+	h.logger.Logf(
+		t,
+		"Creating a port forwarding tunnel for resource %s/%s routing local port %d to remote port %d",
+		terratestk8s.ResourceTypePod,
+		consulServerPodName,
+		localPort,
+		remotePort,
+	)
+
+	kubeConfigPath, err := h.helmOptions.KubectlOptions.GetConfigPath(t)
+	if err != nil {
+		h.logger.Logf(t, "Error getting kube config path: %s", err)
+		return err
+	}
+	config, err := terratestk8s.LoadApiClientConfigE(kubeConfigPath, h.helmOptions.KubectlOptions.ContextName)
+	if err != nil {
+		terratestLogger.Logf(t, "Error loading Kubernetes config: %s", err)
+		return err
+	}
+
+	// Build a url to the portforward endpoint
+	// example: http://localhost:8080/api/v1/namespaces/helm/pods/tiller-deploy-9itlq/portforward
+	postEndpoint := h.kubernetesClient.CoreV1().RESTClient().Post()
+	namespace := h.helmOptions.KubectlOptions.Namespace
+	portForwardCreateURL := postEndpoint.
+		Resource("pods").
+		Namespace(namespace).
+		Name(consulServerPodName).
+		SubResource("portforward").
+		URL()
+
+	h.logger.Logf(t, "Using URL %s to create portforward", portForwardCreateURL)
+
+	// Construct the spdy client required by the client-go portforward library
+	transport, upgrader, err := spdy.RoundTripperFor(config)
+	if err != nil {
+		h.logger.Logf(t, "Error creating http client: %s", err)
+		return err
+	}
+	dialer := spdy.NewDialer(upgrader, &http.Client{Transport: transport}, "POST", portForwardCreateURL)
+
+	// Construct a new PortForwarder struct that manages the instructed port forward tunnel
+	readyChan := make(chan struct{}, 1)
+	ports := []string{fmt.Sprintf("%d:%d", localPort, remotePort)}
+	portforwarder, err := portforward.New(dialer, ports, stopChan, readyChan, ioutil.Discard, ioutil.Discard)
+	if err != nil {
+		h.logger.Logf(t, "Error creating port forwarding tunnel: %s", err)
+		return err
+	}
+
+	// Open the tunnel in a goroutine so that it is available in the background. Report errors to the main goroutine via
+	// a new channel.
+	errChan := make(chan error)
+	go func() {
+		errChan <- portforwarder.ForwardPorts()
+	}()
+
+	// Wait for an error or the tunnel to be ready
+	select {
+	case err = <-errChan:
+		h.logger.Logf(t, "Error starting port forwarding tunnel: %s", err)
+		return err
+	case <-portforwarder.Ready:
+		h.logger.Logf(t, "Successfully created port forwarding tunnel")
+		return nil
 	}
 }
